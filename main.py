@@ -1,6 +1,6 @@
 from ctransformers import AutoModelForCausalLM
 import time
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
@@ -47,7 +47,7 @@ def ensure_model_exists():
 class Chatbot:
     def __init__(self):
         self.model = None
-        self.conversation_history: List[Tuple[str, str]] = []
+        self.sessions: Dict[str, List[Tuple[str, str]]] = {}
         self.max_history = 5  # Keep last 5 exchanges for context
         
     def initialize_model(self):
@@ -68,44 +68,54 @@ class Chatbot:
             print("Chatbot ready! Type 'quit' to exit.")
             print("-" * 50)
 
-    def format_prompt(self, user_input: str) -> str:
-        # Format conversation history
+    def get_session_history(self, session_id: str) -> List[Tuple[str, str]]:
+        """Get or create session history."""
+        if session_id not in self.sessions:
+            self.sessions[session_id] = []
+        return self.sessions[session_id]
+
+    def format_prompt(self, user_input: str, session_id: str) -> str:
+        history = self.get_session_history(session_id)
         history_text = ""
-        for user_msg, assistant_msg in self.conversation_history[-self.max_history:]:
+        for user_msg, assistant_msg in history[-self.max_history:]:
             history_text += f"[INST] {user_msg} [/INST] {assistant_msg}\n"
-        
-        # Add current user input
         return f"{history_text}[INST] {user_input} [/INST]"
 
-    def update_history(self, user_input: str, response: str):
-        self.conversation_history.append((user_input, response))
-        if len(self.conversation_history) > self.max_history:
-            self.conversation_history.pop(0)
+    def update_history(self, session_id: str, user_input: str, response: str):
+        history = self.get_session_history(session_id)
+        history.append((user_input, response))
+        if len(history) > self.max_history:
+            history.pop(0)
 
-    def get_response(self, user_input: str) -> dict:
+    def get_response(self, user_input: str, session_id: str = "default") -> dict:
         start_time = time.time()
-        prompt = self.format_prompt(user_input)
+        prompt = self.format_prompt(user_input, session_id)
         response = self.model(prompt)
         end_time = time.time()
         
         response = response.strip()
-        self.update_history(user_input, response)
+        self.update_history(session_id, user_input, response)
         
         return {
             "response": response,
-            "response_time": round(end_time - start_time, 2)
+            "response_time": round(end_time - start_time, 2),
+            "session_id": session_id
         }
 
 # Initialize FastAPI app
-app = FastAPI(title="Mistral Chatbot API")
+app = FastAPI(
+    title="Mistral Chatbot API",
+    description="A FastAPI-based chatbot using Mistral-7B model",
+    version="1.0.0"
+)
 
-# Add CORS middleware
+# Add CORS middleware with more specific settings
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],  # In production, replace with your specific domains
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Initialize chatbot
@@ -115,16 +125,17 @@ chatbot.initialize_model()
 # Pydantic models for request/response
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = None
+    session_id: Optional[str] = "default"
 
 class ChatResponse(BaseModel):
     response: str
     response_time: float
+    session_id: str
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
-        result = chatbot.get_response(request.message)
+        result = chatbot.get_response(request.message, request.session_id)
         return ChatResponse(**result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -135,8 +146,15 @@ async def health_check():
         "status": "healthy",
         "model_loaded": chatbot.model is not None,
         "model_path": MODEL_PATH,
-        "model_exists": os.path.exists(MODEL_PATH)
+        "model_exists": os.path.exists(MODEL_PATH),
+        "active_sessions": len(chatbot.sessions)
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Run on all network interfaces (0.0.0.0) to allow external access
+    uvicorn.run(
+        app, 
+        host="0.0.0.0",  # This allows external access
+        port=8000,
+        workers=1  # Single worker for the model
+    )
